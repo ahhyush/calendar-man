@@ -1,6 +1,5 @@
 import os
 import json
-from flask import Flask, Request, Response
 from datetime import date, datetime, timedelta
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
@@ -8,8 +7,6 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
 import telegram
-
-app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
@@ -157,16 +154,16 @@ async def handle_update(update_data: dict):
                 )
 
 
-def handler(request: Request) -> Response:
+def handler(request):
     if request.method == "GET":
-        return Response("Bot is running", status=200)
+        return "Bot is running"
 
     if request.method == "POST":
-        update_data = request.get_json(force=True)
+        update_data = request.json
 
         import asyncio
         asyncio.run(handle_update(update_data))
 
-        return Response("ok", status=200)
+        return "ok"
 
-    return Response("Method not allowed", status=405)
+    return ("Method not allowed", 405)

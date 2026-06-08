@@ -1,14 +1,13 @@
 import os
-from flask import Request, Response
 import telegram
 
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 
-def handler(request: Request) -> Response:
+def handler(request):
     if request.method != "GET":
-        return Response("Use GET to set webhook", status=405)
+        return ("Use GET to set webhook", 405)
 
     host = request.headers.get("x-forwarded-host", request.host)
     webhook_url = f"https://{host}/api/webhook"
@@ -21,4 +20,4 @@ def handler(request: Request) -> Response:
 
     asyncio.run(set_it())
 
-    return Response(f"Webhook set to {webhook_url}", status=200)
+    return f"Webhook set to {webhook_url}"
