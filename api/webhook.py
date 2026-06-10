@@ -69,9 +69,20 @@ def push_to_google_calendar(event: dict):
 def parse_event(message: str) -> dict:
     today = date.today()
     today_str = today.strftime("%A, %Y-%m-%d")
+    days_reference = "\n".join(
+        f"        - {(today + timedelta(days=i)).strftime('%A')} = {(today + timedelta(days=i)).isoformat()}"
+        for i in range(14)
+    )
     prompt = """
         You extract calendar events from natural language.
-        Use the provided current date and timezone to resolve relative dates such as "tomorrow", "next Friday", "next month", and "in 2 weeks".
+        Use the reference calendar below to resolve relative dates. Do NOT compute dates yourself — use the mapping directly.
+
+        Reference calendar (next 14 days):
+{days}
+
+        Today is {today}.
+        "Tomorrow" = the day after today.
+        "This Thursday" or "Thursday" = the next upcoming Thursday from the reference above.
 
         Rules:
         - If the event has no specific time and must span the whole day (e.g. "birthday", "holiday", "anniversary", "day off"), set all_day to true, time to "00:00", and duration_minutes to "0".
@@ -84,8 +95,7 @@ def parse_event(message: str) -> dict:
         - Do not invent information that is not implied by the input.
         - If a date cannot be determined, return null.
         - If a time cannot be determined and all_day is false, return null.
-        - Today is {} (day of week, YYYY-MM-DD)
-    """.format(today_str)
+    """.format(days=days_reference, today=today_str)
 
     client = OpenAI()
     response = client.chat.completions.create(
