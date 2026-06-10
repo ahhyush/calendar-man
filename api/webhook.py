@@ -66,34 +66,54 @@ def push_to_google_calendar(event: dict):
     service.events().insert(calendarId="primary", body=body).execute()
 
 
-def get_todays_events() -> str:
+def get_events(days: int = 1) -> str:
     service = get_google_calendar_service()
     now = datetime.now()
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "+08:00"
-    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat() + "+08:00"
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start_of_day + timedelta(days=days)
 
     result = service.events().list(
         calendarId="primary",
-        timeMin=start_of_day,
-        timeMax=end_of_day,
+        timeMin=start_of_day.isoformat() + "+08:00",
+        timeMax=end.isoformat() + "+08:00",
         singleEvents=True,
         orderBy="startTime",
     ).execute()
 
     events = result.get("items", [])
     if not events:
-        return "You have no events scheduled for today."
+        if days == 1:
+            return "You have no events scheduled for today."
+        return "You have no events scheduled this week."
 
-    lines = [f"Your events for {now.strftime('%A, %d %B %Y')}:\n"]
+    if days == 1:
+        lines = [f"Your events for {now.strftime('%A, %d %B %Y')}:\n"]
+    else:
+        end_date = (now + timedelta(days=days - 1)).strftime('%A, %d %B')
+        lines = [f"Your events for the week ({now.strftime('%d %B')} - {end_date}):\n"]
+
+    current_date = None
     for event in events:
         summary = event.get("summary", "No title")
         start = event["start"]
         if "dateTime" in start:
-            time_str = datetime.fromisoformat(start["dateTime"]).strftime("%I:%M %p")
+            event_dt = datetime.fromisoformat(start["dateTime"])
+            if days > 1:
+                event_date_str = event_dt.strftime("%A, %d %B")
+                if event_date_str != current_date:
+                    current_date = event_date_str
+                    lines.append(f"\n{current_date}:")
+            time_str = event_dt.strftime("%I:%M %p")
             end_time = datetime.fromisoformat(event["end"]["dateTime"]).strftime("%I:%M %p")
-            lines.append(f"- {time_str} - {end_time}: {summary}")
+            lines.append(f"  - {time_str} - {end_time}: {summary}")
         else:
-            lines.append(f"- All day: {summary}")
+            event_date = start.get("date", "")
+            if days > 1:
+                event_date_str = datetime.strptime(event_date, "%Y-%m-%d").strftime("%A, %d %B")
+                if event_date_str != current_date:
+                    current_date = event_date_str
+                    lines.append(f"\n{current_date}:")
+            lines.append(f"  - All day: {summary}")
 
     return "\n".join(lines)
 
@@ -173,7 +193,7 @@ async def handle_update(update_data: dict):
             )
             await bot.send_message(chat_id=chat_id, text=welcome)
         elif text == "/read":
-            reply = get_todays_events()
+            reply = get_events(days=1)
             await bot.send_message(chat_id=chat_id, text=reply)
         else:
             response_json = parse_event(text)
@@ -214,3 +234,4 @@ def handler():
     asyncio.run(handle_update(update_data))
 
     return "ok"
+
