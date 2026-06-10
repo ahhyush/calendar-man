@@ -1,21 +1,18 @@
+from flask import Flask, request
 import os
+import asyncio
 import telegram
 
+app = Flask(__name__)
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
-
-def handler(request):
-    if request.method != "GET":
-        return ("Use GET to set webhook", 405)
-
+@app.route("/api/set_webhook", methods=["GET"])
+def handler():
     host = request.headers.get("x-forwarded-host", request.host)
     webhook_url = f"https://{host}/api/webhook"
 
-    import asyncio
-
     async def set_it():
-        bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+        bot = telegram.Bot(token=os.environ["TELEGRAM_BOT_TOKEN"])
         await bot.set_webhook(url=webhook_url)
 
     asyncio.run(set_it())
