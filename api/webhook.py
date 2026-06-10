@@ -8,10 +8,6 @@ from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
 import telegram
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-
-
 class CalendarResponse(BaseModel):
     model_config = ConfigDict(json_schema_extra={"additionalProperties": False})
 
@@ -107,6 +103,7 @@ def parse_event(message: str) -> dict:
 
 
 async def handle_update(update_data: dict):
+    bot = telegram.Bot(token=os.environ["TELEGRAM_BOT_TOKEN"])
     update = telegram.Update.de_json(update_data, bot)
 
     if update.message and update.message.text:
