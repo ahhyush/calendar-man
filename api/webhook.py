@@ -66,6 +66,38 @@ def push_to_google_calendar(event: dict):
     service.events().insert(calendarId="primary", body=body).execute()
 
 
+def get_todays_events() -> str:
+    service = get_google_calendar_service()
+    now = datetime.now()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "+08:00"
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat() + "+08:00"
+
+    result = service.events().list(
+        calendarId="primary",
+        timeMin=start_of_day,
+        timeMax=end_of_day,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+
+    events = result.get("items", [])
+    if not events:
+        return "You have no events scheduled for today."
+
+    lines = [f"Your events for {now.strftime('%A, %d %B %Y')}:\n"]
+    for event in events:
+        summary = event.get("summary", "No title")
+        start = event["start"]
+        if "dateTime" in start:
+            time_str = datetime.fromisoformat(start["dateTime"]).strftime("%I:%M %p")
+            end_time = datetime.fromisoformat(event["end"]["dateTime"]).strftime("%I:%M %p")
+            lines.append(f"- {time_str} - {end_time}: {summary}")
+        else:
+            lines.append(f"- All day: {summary}")
+
+    return "\n".join(lines)
+
+
 def parse_event(message: str) -> dict:
     today = date.today()
     today_str = today.strftime("%A, %Y-%m-%d")
@@ -130,6 +162,8 @@ async def handle_update(update_data: dict):
             welcome = (
                 f"Welcome {first_name}!\n\n"
                 "Send me an event or reminder in plain English, and I'll turn it into a structured calendar entry.\n\n"
+                "Commands:\n"
+                "/read - View today's events\n\n"
                 "Examples:\n"
                 "- Meeting with John at 3pm Friday\n"
                 "- Gym every Monday at 7am\n"
@@ -138,6 +172,9 @@ async def handle_update(update_data: dict):
                 "Just send me your event to get started!"
             )
             await bot.send_message(chat_id=chat_id, text=welcome)
+        elif text == "/read":
+            reply = get_todays_events()
+            await bot.send_message(chat_id=chat_id, text=reply)
         else:
             response_json = parse_event(text)
 
