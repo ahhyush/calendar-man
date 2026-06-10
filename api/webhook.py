@@ -1,3 +1,4 @@
+from flask import Flask, request
 import os
 import json
 from datetime import date, datetime, timedelta
@@ -7,6 +8,9 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
 import telegram
+
+app = Flask(__name__)
+
 
 class CalendarResponse(BaseModel):
     model_config = ConfigDict(json_schema_extra={"additionalProperties": False})
@@ -151,16 +155,14 @@ async def handle_update(update_data: dict):
                 )
 
 
-def handler(request):
+@app.route("/api/webhook", methods=["GET", "POST"])
+def handler():
     if request.method == "GET":
         return "Bot is running"
 
-    if request.method == "POST":
-        update_data = request.json
+    update_data = request.get_json()
 
-        import asyncio
-        asyncio.run(handle_update(update_data))
+    import asyncio
+    asyncio.run(handle_update(update_data))
 
-        return "ok"
-
-    return ("Method not allowed", 405)
+    return "ok"
