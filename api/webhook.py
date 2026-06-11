@@ -135,6 +135,10 @@ def parse_event(message: str) -> dict:
         Today is {today}.
         "Tomorrow" = the day after today.
         "This Thursday" or "Thursday" = the next upcoming Thursday from the reference above.
+        "Next Thursday" = the Thursday after the next upcoming Thursday from the reference above.
+        "Next week" = the 7-day period starting from the next upcoming Monday from the reference above.
+        "Next month" = the same date in the next calendar month, or the last date of the next calendar month if the same date doesn't exist.
+        "In 2 weeks" = the same date 14 days from the reference today, or the last date of that month if the same date doesn't exist.
 
         Rules:
         - If the event has no specific time and must span the whole day (e.g. "birthday", "holiday", "anniversary", "day off"), set all_day to true, time to "00:00", and duration_minutes to "0".
