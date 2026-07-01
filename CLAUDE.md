@@ -12,12 +12,11 @@ which matches the hardcoded `Asia/Singapore` timezone used throughout.
 ```
 Telegram  ──POST──▶  /api/webhook  ──▶  handle_update()
                                           ├─ callback_query (button tap) → handle_callback() → delete_event()
-                                          ├─ "/start"  → welcome message
-                                          ├─ "/read"   → get_events(days=1) → Google Calendar list
-                                          └─ free text → parse_event() → OpenAI (strict JSON schema)
-                                                          │ intent == "create" → push_to_google_calendar()
-                                                          │ intent == "delete" → find_events() → inline buttons
-                                                          └ intent == "list"   → get_events(days=1)
+                                          ├─ "/start"          → welcome message
+                                          ├─ "/read"           → get_events(days=1) → Google Calendar list
+                                          ├─ "/delete <query>" → parse_event(intent=delete) → find_events() → inline buttons
+                                          └─ free text         → parse_event() → OpenAI (strict JSON schema)
+                                                                → push_to_google_calendar()
 
 Vercel Cron (daily) ──GET──▶  /api/cron/daily  ──▶  get_events(days=1) → daily agenda DM
 ```
@@ -43,15 +42,17 @@ The cron runs `0 0 * * *` **UTC** = 8am Singapore (a morning agenda, not local m
 
 ## LLM parsing
 
-`parse_event()` calls OpenAI (`gpt-4.1-nano`) with a `strict` JSON schema derived from the
-`CalendarResponse` Pydantic model (fields: `intent`, `date`, `time`, `duration_minutes`,
-`all_day`, `description`, `repeat`, `location`). Defaults enforced by the prompt: duration →
-60 min, repeat → "never", location → "None".
+`parse_event(message, intent)` calls OpenAI (`gpt-4.1-nano`) with a `strict` JSON schema
+derived from the `CalendarResponse` Pydantic model (fields: `date`, `time`,
+`duration_minutes`, `all_day`, `description`, `repeat`, `location`). Defaults enforced by the
+prompt: duration → 60 min, repeat → "never", location → "None".
 
-`intent` classifies the message as `create` (default — add an event), `delete` (remove an
-existing event), or `list` (show today's events). `handle_update` routes on it. For `delete`
-and `list`, only `date` and `description` (the identifying keywords) matter; the other fields
-keep their defaults.
+**Intent is driven by the command, not the LLM.** `handle_update` decides intent from the
+message: `/delete <query>` → delete, `/read` → read, anything else → create. It then passes
+that `intent` into `parse_event`, which swaps the intent-specific half of the prompt. For
+`delete`, only `date` and `description` (the identifying keywords) are extracted and the date
+is optional (`/delete gym` with no date searches a 30-day window). This avoids relying on the
+model to classify create-vs-delete.
 
 **Date resolution is the tricky part.** LLMs are unreliable at date arithmetic, so the prompt
 does **not** ask the model to compute dates. Instead `parse_event()` precomputes a **14-day
@@ -63,8 +64,9 @@ mapping directly. If you touch the parsing prompt, preserve this pattern.
 
 ## Deleting events (stateless, button-driven)
 
-Deletion keeps the same natural-language input ("cancel gym tomorrow") — there is no delete
-slash command. When `parse_event` returns `intent == "delete"`:
+Deletion is triggered by the `/delete <query>` command, where the query is still natural
+language ("gym tomorrow", "dentist appointment"). `handle_update` strips the command, calls
+`parse_event(query, intent="delete")` to extract the date + keywords, then:
 
 1. `find_events(date, keywords)` searches the calendar (same `events().list()` pattern as
    `get_events`, using Google's free-text `q` param), scoped to the parsed day or a 30-day

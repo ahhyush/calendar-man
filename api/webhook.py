@@ -20,7 +20,6 @@ CALLBACK_DATA_LIMIT = 64
 class CalendarResponse(BaseModel):
     model_config = ConfigDict(json_schema_extra={"additionalProperties": False})
 
-    intent: str
     date: str
     time: str
     duration_minutes: str
@@ -182,14 +181,14 @@ def find_events(date_str: str, keywords: str, limit: int = 5) -> list:
     return result.get("items", [])[:limit]
 
 
-def parse_event(message: str) -> dict:
+def parse_event(message: str, intent: str = "create") -> dict:
     today = date.today()
     today_str = today.strftime("%A, %Y-%m-%d")
     days_reference = "\n".join(
         f"        - {(today + timedelta(days=i)).strftime('%A')} = {(today + timedelta(days=i)).isoformat()}"
         for i in range(14)
     )
-    prompt = """
+    common = """
         You extract calendar events from natural language.
         Use the reference calendar below to resolve relative dates. Do NOT compute dates yourself — use the mapping directly.
 
@@ -203,16 +202,18 @@ def parse_event(message: str) -> dict:
         "Next week" = the 7-day period starting from the next upcoming Monday from the reference above.
         "Next month" = the same date in the next calendar month, or the last date of the next calendar month if the same date doesn't exist.
         "In 2 weeks" = the same date 14 days from the reference today, or the last date of that month if the same date doesn't exist.
+    """.format(days=days_reference, today=today_str)
 
-        First classify the user's intent:
-        - "delete" if they want to remove/cancel/delete an existing event (e.g. "cancel gym tomorrow", "remove my dentist appointment", "delete lunch on Friday").
-        - "list" if they only want to see their schedule (e.g. "what's on today", "show my events").
-        - "create" otherwise (the default: adding a new event or reminder).
-        Set the "intent" field accordingly.
-
-        For "delete" and "list" intents, only "date" and "description" matter — put the event's identifying keywords in "description" (e.g. "gym", "dentist appointment") and resolve any date as usual. Leave the other fields at their defaults. Do not require a time for a delete or list.
-
-        Rules (for the "create" intent):
+    if intent == "delete":
+        specifics = """
+        The user wants to DELETE an existing event. Extract only what identifies it:
+        - Put the event's identifying keywords in "description" (e.g. "gym", "dentist appointment").
+        - Resolve any date mentioned into "date". If no date is mentioned, leave "date" empty — do NOT invent one.
+        - A time is not required. Leave time, duration, repeat, location and all_day at their defaults.
+        """
+    else:
+        specifics = """
+        The user wants to CREATE an event. Rules:
         - If the event has no specific time and must span the whole day (e.g. "birthday", "holiday", "anniversary", "day off"), set all_day to true, time to "00:00", and duration_minutes to "0".
         - If a specific time is mentioned, set all_day to false.
         - If duration is not specified and all_day is false, use 60 minutes.
@@ -223,7 +224,9 @@ def parse_event(message: str) -> dict:
         - Do not invent information that is not implied by the input.
         - If a date cannot be determined, return null.
         - If a time cannot be determined and all_day is false, return null.
-    """.format(days=days_reference, today=today_str)
+        """
+
+    prompt = common + specifics
 
     client = OpenAI()
     response = client.chat.completions.create(
@@ -356,13 +359,16 @@ async def handle_update(update_data: dict):
         chat_id = update.message.chat_id
         text = update.message.text
 
+        # Intent is driven by the command, not inferred by the LLM:
+        #   /delete <query> → delete, /read → read, anything else → create.
         if text == "/start":
             first_name = update.effective_user.first_name
             welcome = (
                 f"Welcome {first_name}!\n\n"
                 "Send me an event or reminder in plain English, and I'll turn it into a structured calendar entry.\n\n"
                 "Commands:\n"
-                "/read - View today's events\n\n"
+                "/read - View today's events\n"
+                "/delete <event> - Delete an event, e.g. /delete gym tomorrow\n\n"
                 "Examples:\n"
                 "- Meeting with John at 3pm Friday\n"
                 "- Gym every Monday at 7am\n"
@@ -374,17 +380,18 @@ async def handle_update(update_data: dict):
         elif text == "/read":
             reply = get_events(days=1)
             await bot.send_message(chat_id=chat_id, text=reply)
+        elif text == "/delete" or text.startswith("/delete "):
+            query = text[len("/delete"):].strip()
+            if not query:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Tell me what to delete, e.g. /delete gym tomorrow",
+                )
+                return
+            parsed = parse_event(query, intent="delete")
+            await handle_delete_request(bot, chat_id, parsed)
         else:
             response_json = parse_event(text)
-            intent = response_json.get("intent", "create")
-
-            if intent == "delete":
-                await handle_delete_request(bot, chat_id, response_json)
-                return
-
-            if intent == "list":
-                await bot.send_message(chat_id=chat_id, text=get_events(days=1))
-                return
 
             if response_json.get("date") and (response_json.get("all_day") or response_json.get("time")):
                 push_to_google_calendar(response_json)

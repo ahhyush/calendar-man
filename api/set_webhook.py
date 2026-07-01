@@ -11,6 +11,7 @@ app = Flask(__name__)
 COMMANDS = [
     BotCommand("start", "Show welcome message and instructions"),
     BotCommand("read", "View today's events"),
+    BotCommand("delete", "Delete an event, e.g. /delete gym tomorrow"),
 ]
 
 
