@@ -1,0 +1,92 @@
+# calendar-man
+
+A Telegram bot that turns plain-English messages (e.g. "Gym every Monday at 7am")
+into Google Calendar events. Natural-language parsing is done by an LLM; the parsed
+result is written to the user's primary Google Calendar.
+
+Deployed as **Vercel Python serverless functions** in region `sin1` (Singapore),
+which matches the hardcoded `Asia/Singapore` timezone used throughout.
+
+## Architecture
+
+```
+Telegram  ──POST──▶  /api/webhook  ──▶  handle_update()
+                                          ├─ "/start"  → welcome message
+                                          ├─ "/read"   → get_events(days=1) → Google Calendar list
+                                          └─ free text → parse_event() → OpenAI (strict JSON schema)
+                                                                        → push_to_google_calendar()
+
+Vercel Cron (daily) ──GET──▶  /api/cron/daily  ──▶  get_events(days=1) → daily agenda DM
+```
+
+Everything deployed lives under `api/`. There are three serverless functions, each a
+standalone Flask app:
+
+- **[api/webhook.py](api/webhook.py)** — the main endpoint (`/api/webhook`). Receives
+  Telegram updates. `POST` handles messages; `GET` is a health check ("Bot is running").
+  Contains the core logic: `parse_event()`, `push_to_google_calendar()`, `get_events()`,
+  `get_google_calendar_service()`.
+- **[api/set_webhook.py](api/set_webhook.py)** — one-time setup endpoint (`/api/set_webhook`,
+  `GET`). Registers the webhook URL with Telegram, derived from the incoming request host.
+  Hit this once after each deploy to a new URL.
+- **[api/cron/daily.py](api/cron/daily.py)** — cron target (`/api/cron/daily`, `GET`).
+  Sends a daily agenda to a fixed `TELEGRAM_CHAT_ID`. Guarded by a `CRON_SECRET` bearer
+  token. Imports `get_events` from `api/webhook.py` via a `sys.path` insert (see gotchas).
+
+Routing, builds, region, and the cron schedule are all declared in [vercel.json](vercel.json).
+The cron runs `0 0 * * *` **UTC** = 8am Singapore (a morning agenda, not local midnight).
+
+## LLM parsing
+
+`parse_event()` calls OpenAI (`gpt-4.1-nano`) with a `strict` JSON schema derived from the
+`CalendarResponse` Pydantic model (fields: `date`, `time`, `duration_minutes`, `all_day`,
+`description`, `repeat`, `location`). Defaults enforced by the prompt: duration → 60 min,
+repeat → "never", location → "None".
+
+**Date resolution is the tricky part.** LLMs are unreliable at date arithmetic, so the prompt
+does **not** ask the model to compute dates. Instead `parse_event()` precomputes a **14-day
+reference calendar** (weekday → ISO date) and instructs the model to look dates up from that
+mapping directly. If you touch the parsing prompt, preserve this pattern.
+
+`repeat` maps to a Google `RRULE:FREQ=...` in `push_to_google_calendar()`
+(daily/weekly/monthly/yearly; "never" → no recurrence).
+
+## Environment variables
+
+| Var | Used by | Purpose |
+|-----|---------|---------|
+| `TELEGRAM_BOT_TOKEN` | all `api/` functions | Telegram bot auth |
+| `OPENAI_API_KEY`     | webhook (`OpenAI()` reads it implicitly) | LLM calls |
+| `GOOGLE_TOKEN_JSON`  | webhook, cron | Google OAuth creds as a JSON string (contents of `token.json`) |
+| `CRON_SECRET`        | cron | Bearer token protecting the cron endpoint |
+| `TELEGRAM_CHAT_ID`   | cron | Chat that receives the daily agenda |
+
+## Bootstrapping Google OAuth credentials
+
+`GOOGLE_TOKEN_JSON` is the string contents of a `token.json` produced by an OAuth
+Installed-App flow (scope `https://www.googleapis.com/auth/calendar`). To (re)generate it
+locally you need a `credentials.json` from Google Cloud, then run the standard
+`InstalledAppFlow.from_client_secrets_file(...).run_local_server(port=0)` flow and paste the
+resulting `token.json` into the `GOOGLE_TOKEN_JSON` env var. In production the token is only
+refreshed in memory per request (serverless can't persist it back), which works because the
+refresh token is long-lived.
+
+`credentials.json` and `token.json` are gitignored and must never be committed.
+
+## Gotchas
+
+- **Two Flask apps per module.** Each `api/*.py` defines its own `app = Flask(__name__)`;
+  Vercel routes to each file independently. Don't try to unify them into one app.
+- **`sys.path` hack in cron.** [api/cron/daily.py](api/cron/daily.py) inserts the repo root
+  onto `sys.path` to `import get_events` from `api/webhook.py`. Shared logic currently lives
+  in `webhook.py`; if that grows, consider extracting a shared module both import.
+- **Per-request clients.** `telegram.Bot`, `OpenAI`, and the Google Calendar service are all
+  constructed fresh on every request. Fine for serverless; just don't expect connection reuse.
+- **`get_events(days=N)`** supports a multi-day/weekly view (with per-day headers) but nothing
+  currently calls it with `days > 1`.
+
+## Local development
+
+There is no long-polling local runner in the repo. Test against the deployed webhook, or run
+the Flask apps locally and point Telegram at a tunnel (e.g. via `set_webhook`). Dependencies
+are pinned in [requirements.txt](requirements.txt).
