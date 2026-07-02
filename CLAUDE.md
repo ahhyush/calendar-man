@@ -55,9 +55,13 @@ is optional (`/delete gym` with no date searches a 30-day window). This avoids r
 model to classify create-vs-delete.
 
 **Date resolution is the tricky part.** LLMs are unreliable at date arithmetic, so the prompt
-does **not** ask the model to compute dates. Instead `parse_event()` precomputes a **14-day
-reference calendar** (weekday → ISO date) and instructs the model to look dates up from that
-mapping directly. If you touch the parsing prompt, preserve this pattern.
+does **not** ask the model to compute dates. Instead `parse_event()` precomputes a **35-day
+reference calendar** — each line is `weekday day-of-month month year = ISO date` — and instructs
+the model to look dates up from that mapping directly. The 35-day span and the day-of-month on
+each line are what let it resolve both relative refs ("day after tomorrow", "next Friday") and
+absolute ones ("the 11th", "11 July"). The prompt also mandates `YYYY-MM-DD` output, since
+`find_events` silently falls back to a 30-day window if it can't `strptime` the date. If you
+touch the parsing prompt, preserve these patterns.
 
 `repeat` maps to a Google `RRULE:FREQ=...` in `push_to_google_calendar()`
 (daily/weekly/monthly/yearly; "never" → no recurrence).
@@ -76,9 +80,14 @@ Deletion is triggered by the `/delete <query>` command, where the query is still
 language ("gym tomorrow", "dentist appointment"). `handle_update` strips the command, calls
 `parse_event(query, intent="delete")` to extract the date + keywords, then:
 
-1. `find_events(date, keywords)` searches the calendar (same `events().list()` pattern as
-   `get_events`, using Google's free-text `q` param), scoped to the parsed day or a 30-day
-   window if no date was given.
+1. `find_events(date, keywords)` lists events for the parsed day (or a 30-day window if no
+   date was given), then **matches locally** — it does NOT use Google's literal `q` search.
+   Each event's title is scored by `_match_score()` (token overlap + `difflib` fuzzy ratio +
+   a small `KEYWORD_SYNONYMS` map, so "bday" matches "Birthday"); events at or above
+   `MATCH_THRESHOLD` (0.6) are kept, ranked best-first. If `keywords` is empty (the user gave
+   only a date and/or a generic word like "event"), every event in the window is offered.
+   Short keyword tokens (< 4 chars) must match exactly or via a synonym — this stops "app"
+   from spuriously matching "Apply".
 2. `build_delete_keyboard()` turns the candidates into a Telegram **inline keyboard**:
    0 matches → "not found"; 1 match → a confirm button (recurring events also get a
    "delete the whole series" button); many → one button per candidate.
@@ -130,8 +139,12 @@ refresh token is long-lived.
   in `webhook.py`; if that grows, consider extracting a shared module both import.
 - **Per-request clients.** `telegram.Bot`, `OpenAI`, and the Google Calendar service are all
   constructed fresh on every request. Fine for serverless; just don't expect connection reuse.
-- **`get_events(days=N)`** supports a multi-day/weekly view (with per-day headers) but nothing
-  currently calls it with `days > 1`.
+- **Timezone: always use `sgt_now()` / `today_sgt()`, never `datetime.now()` / `date.today()`.**
+  Vercel runs in UTC; the bot operates in Singapore (`SGT = UTC+8`). The helpers return
+  timezone-aware SGT values whose `.isoformat()` already carries `+08:00` — so do NOT append a
+  `"+08:00"` suffix to their output (that would double the offset). Using the naive clock skews
+  day boundaries by up to 8 hours near midnight, which matters for date-scoped `/delete` and
+  `/read`.
 
 ## Local development
 

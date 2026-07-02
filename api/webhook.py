@@ -1,7 +1,9 @@
 from flask import Flask, request
 import os
 import json
-from datetime import date, datetime, timedelta
+import re
+from difflib import SequenceMatcher
+from datetime import date, datetime, timedelta, timezone
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 from google.oauth2.credentials import Credentials
@@ -11,6 +13,21 @@ import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 app = Flask(__name__)
+
+# The bot operates in Singapore time. Vercel servers run in UTC, so we must
+# convert explicitly rather than trusting the naive local clock.
+SGT = timezone(timedelta(hours=8))
+
+
+def sgt_now() -> datetime:
+    """Current time in Singapore, timezone-aware."""
+    return datetime.now(SGT)
+
+
+def today_sgt() -> date:
+    """Today's calendar date in Singapore (not the server's UTC date)."""
+    return sgt_now().date()
+
 
 # Telegram limits inline-button callback_data to 64 bytes. Google event ids
 # (and recurring-instance ids) fit comfortably, but we guard against overflow.
@@ -22,6 +39,72 @@ READ_RANGES = {
     "week": ("This week", 7),
     "month": ("This month", 30),
 }
+
+# Fuzzy matching for /delete. A candidate event's summary scores against the
+# user's keywords; anything at or above MATCH_THRESHOLD is offered.
+MATCH_THRESHOLD = 0.6
+
+# Common short-forms so "bday" matches "Birthday", etc. Values are canonical
+# forms that also appear in real event titles.
+KEYWORD_SYNONYMS = {
+    "bday": "birthday",
+    "bdays": "birthday",
+    "anniv": "anniversary",
+    "appt": "appointment",
+    "apt": "appointment",
+    "mtg": "meeting",
+    "meet": "meeting",
+    "doc": "doctor",
+    "dr": "doctor",
+}
+
+
+def _tokens(text: str) -> list:
+    """Lowercase alphanumeric word tokens."""
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def _match_score(keywords: str, summary: str) -> float:
+    """Similarity of a user's delete keywords against an event summary, in [0, 1].
+
+    Combines token overlap (with light synonym expansion) and fuzzy string
+    similarity, so "bday" matches "Birthday", "dentist" matches "Dentist
+    appointment", and typos still score. Returns 0 when there is no signal."""
+    kw_tokens = _tokens(keywords)
+    if not kw_tokens:
+        # No keywords → caller decides (treated as "match everything").
+        return 1.0
+
+    summary_tokens = _tokens(summary)
+    summary_set = set(summary_tokens)
+
+    # 1) Per-keyword-token best match against summary tokens.
+    per_token = []
+    for kw in kw_tokens:
+        canon = KEYWORD_SYNONYMS.get(kw, kw)
+        candidates = {kw, canon}
+        best = 0.0
+        for st in summary_set:
+            if st in candidates:
+                best = 1.0
+                break
+            # Prefix overlap or fuzzy similarity only count when the shorter side
+            # is substantial (>= 4 chars). Otherwise a 3-char token like "app"
+            # would spuriously match "apply" (prefix) or score 0.75 fuzzily —
+            # short keywords must match exactly or via a synonym. "dentist" still
+            # matches "dentists"/"dentist appointment", and typos still score.
+            if any(min(len(st), len(c)) >= 4 for c in candidates):
+                if any(st.startswith(c) or c.startswith(st) for c in candidates):
+                    best = 1.0
+                    break
+                best = max(best, SequenceMatcher(None, canon, st).ratio())
+        per_token.append(best)
+    token_score = sum(per_token) / len(per_token)
+
+    # 2) Whole-string fuzzy ratio (catches word-order / phrasing differences).
+    string_score = SequenceMatcher(None, keywords.lower(), (summary or "").lower()).ratio()
+
+    return max(token_score, string_score)
 
 
 class CalendarResponse(BaseModel):
@@ -87,14 +170,14 @@ def delete_event(event_id: str):
 
 def get_events(days: int = 1, label: str = "") -> str:
     service = get_google_calendar_service()
-    now = datetime.now()
+    now = sgt_now()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start_of_day + timedelta(days=days)
 
     result = service.events().list(
         calendarId="primary",
-        timeMin=start_of_day.isoformat() + "+08:00",
-        timeMax=end.isoformat() + "+08:00",
+        timeMin=start_of_day.isoformat(),
+        timeMax=end.isoformat(),
         singleEvents=True,
         orderBy="startTime",
     ).execute()
@@ -150,13 +233,21 @@ def _format_when(event: dict) -> str:
     return ""
 
 
-def find_events(date_str: str, keywords: str, limit: int = 5) -> list:
-    """Find candidate events matching keywords, optionally scoped to a date.
+def find_events(date_str: str, keywords: str, limit: int = 10) -> list:
+    """Find candidate events to delete, by date and/or fuzzy keyword similarity.
 
     Models the events().list() call in get_events(). If a date is given, search
-    that single day; otherwise search a 30-day window from today. Google's `q`
-    pre-filters by text; results are returned newest-listing-order, capped at
-    `limit`."""
+    that single day; otherwise search a 30-day window from today.
+
+    Matching is done locally, not via Google's literal `q` search:
+    - No keywords → return every event in the window (e.g. "delete event on the
+      11th" offers all of July 11's events).
+    - With keywords → keep events whose summary scores >= MATCH_THRESHOLD via
+      `_match_score` (so "bday" matches "Birthday"), ranked best-first.
+
+    Ordered best-match-first when scoring; date order otherwise. `limit` caps the
+    number of buttons offered (Telegram keyboards can't be unbounded); if it's
+    hit, callers should tell the user to narrow their query."""
     service = get_google_calendar_service()
 
     if date_str:
@@ -168,56 +259,74 @@ def find_events(date_str: str, keywords: str, limit: int = 5) -> list:
         day = None
 
     if day:
-        start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = day.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=SGT)
         end = start + timedelta(days=1)
     else:
-        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        start = sgt_now().replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=30)
 
-    list_kwargs = dict(
+    result = service.events().list(
         calendarId="primary",
-        timeMin=start.isoformat() + "+08:00",
-        timeMax=end.isoformat() + "+08:00",
+        timeMin=start.isoformat(),
+        timeMax=end.isoformat(),
         singleEvents=True,
         orderBy="startTime",
-        maxResults=25,
-    )
-    if keywords:
-        list_kwargs["q"] = keywords
+        maxResults=50,
+    ).execute()
+    events = result.get("items", [])
 
-    result = service.events().list(**list_kwargs).execute()
-    return result.get("items", [])[:limit]
+    if not (keywords or "").strip():
+        # Generic delete ("event on the 11th"): offer everything in the window.
+        return events[:limit]
+
+    scored = [
+        (_match_score(keywords, e.get("summary", "")), e)
+        for e in events
+    ]
+    matches = [(s, e) for s, e in scored if s >= MATCH_THRESHOLD]
+    matches.sort(key=lambda se: se[0], reverse=True)
+    return [e for _s, e in matches[:limit]]
 
 
 def parse_event(message: str, intent: str = "create") -> dict:
-    today = date.today()
+    today = today_sgt()
     today_str = today.strftime("%A, %Y-%m-%d")
+    # Reference calendar: 35 days of weekday + day-of-month + ISO date, so the
+    # model can look up BOTH relative refs ("day after tomorrow", "next Friday")
+    # and absolute ones ("the 11th", "11 July") without doing date arithmetic.
     days_reference = "\n".join(
-        f"        - {(today + timedelta(days=i)).strftime('%A')} = {(today + timedelta(days=i)).isoformat()}"
-        for i in range(14)
+        f"        - {(today + timedelta(days=i)).strftime('%A %d %B %Y')} "
+        f"= {(today + timedelta(days=i)).isoformat()}"
+        for i in range(35)
     )
     common = """
         You extract calendar events from natural language.
-        Use the reference calendar below to resolve relative dates. Do NOT compute dates yourself — use the mapping directly.
+        Use the reference calendar below to resolve dates. Do NOT compute dates yourself — look them up in the mapping.
 
-        Reference calendar (next 14 days):
+        Reference calendar (starting today):
 {days}
 
         Today is {today}.
-        "Tomorrow" = the day after today.
-        "This Thursday" or "Thursday" = the next upcoming Thursday from the reference above.
-        "Next Thursday" = the Thursday after the next upcoming Thursday from the reference above.
-        "Next week" = the 7-day period starting from the next upcoming Monday from the reference above.
-        "Next month" = the same date in the next calendar month, or the last date of the next calendar month if the same date doesn't exist.
-        "In 2 weeks" = the same date 14 days from the reference today, or the last date of that month if the same date doesn't exist.
+        "Today" = the first line above. "Tomorrow" = the second line. "The day after tomorrow" = the third line.
+        "This Friday" or "Friday" = the next line whose weekday is Friday. "Next Friday" = the Friday after that.
+        "Next week" = the 7-day period starting from the next upcoming Monday in the mapping.
+        "Next month" = the same day-of-month in the next calendar month (or that month's last day if it doesn't exist).
+        "In N days" / "in N weeks" = count that many lines / weeks down the mapping.
+        Absolute dates such as "the 11th", "11 July", or "July 11" = find the line in the mapping with that day-of-month (and month, if given) and use its ISO date. If the requested date is not in the mapping at all, only then compute it directly, assuming the next such date on or after today.
+        ALWAYS output "date" strictly as YYYY-MM-DD (e.g. 2026-07-11), never as words. If you genuinely cannot determine a date, use an empty string.
     """.format(days=days_reference, today=today_str)
 
     if intent == "delete":
         specifics = """
-        The user wants to DELETE an existing event. Extract only what identifies it:
-        - Put the event's identifying keywords in "description" (e.g. "gym", "dentist appointment").
-        - Resolve any date mentioned into "date". If no date is mentioned, leave "date" empty — do NOT invent one.
-        - A time is not required. Leave time, duration, repeat, location and all_day at their defaults.
+        The user wants to DELETE an existing event. Extract two things:
+        - "description": the words that identify WHICH event, e.g. "gym", "dentist", "birthday".
+          Use the user's own words. Do NOT include generic filler like "event", "events",
+          "appointment", "thing", "anything", "something", or date words. If the user only gave
+          a generic word and/or a date (e.g. "event on the 11th", "anything on Friday"), leave
+          "description" as an empty string so ALL events on that date are offered.
+        - "date": resolve any date mentioned using the reference calendar. If no date is
+          mentioned, leave "date" empty — do NOT invent one.
+        A time is not required. Leave time, duration, repeat, location and all_day at their defaults.
         """
     else:
         specifics = """
