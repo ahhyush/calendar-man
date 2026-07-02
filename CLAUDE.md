@@ -13,7 +13,7 @@ which matches the hardcoded `Asia/Singapore` timezone used throughout.
 Telegram  ──POST──▶  /api/webhook  ──▶  handle_update()
                                           ├─ callback_query (button tap) → handle_callback() → delete_event()
                                           ├─ "/start"          → welcome message
-                                          ├─ "/read"           → get_events(days=1) → Google Calendar list
+                                          ├─ "/read"           → range picker (Today/Week/Month) → get_events(days=N)
                                           ├─ "/delete <query>" → parse_event(intent=delete) → find_events() → inline buttons
                                           └─ free text         → parse_event() → OpenAI (strict JSON schema)
                                                                 → push_to_google_calendar()
@@ -28,8 +28,8 @@ standalone Flask app:
   Telegram updates. `POST` handles messages **and inline-button taps**; `GET` is a health
   check ("Bot is running"). Contains the core logic: `parse_event()`,
   `push_to_google_calendar()`, `delete_event()`, `find_events()`, `get_events()`,
-  `build_delete_keyboard()`, `handle_delete_request()`, `handle_callback()`,
-  `get_google_calendar_service()`.
+  `build_read_keyboard()`, `build_delete_keyboard()`, `handle_delete_request()`,
+  `handle_callback()`, `get_google_calendar_service()`.
 - **[api/set_webhook.py](api/set_webhook.py)** — one-time setup endpoint (`/api/set_webhook`,
   `GET`). Registers the webhook URL with Telegram, derived from the incoming request host.
   Hit this once after each deploy to a new URL.
@@ -62,6 +62,14 @@ mapping directly. If you touch the parsing prompt, preserve this pattern.
 `repeat` maps to a Google `RRULE:FREQ=...` in `push_to_google_calendar()`
 (daily/weekly/monthly/yearly; "never" → no recurrence).
 
+## Reading events (range picker)
+
+`/read` doesn't fetch immediately — it replies with an inline keyboard (`build_read_keyboard()`)
+offering **Today / This week / This month**. Tapping a button fires an `r:<key>` callback;
+`handle_callback()` looks up the range in `READ_RANGES` (`key → (label, days)`) and calls
+`get_events(days, label)`, editing the message in place with the results. `get_events` groups
+events by day for multi-day ranges. The daily cron still calls `get_events(days=1)` directly.
+
 ## Deleting events (stateless, button-driven)
 
 Deletion is triggered by the `/delete <query>` command, where the query is still natural
@@ -87,6 +95,9 @@ action covers all cases and only the button label differs.
 **callback_data 64-byte limit:** Telegram caps `callback_data` at 64 bytes. Normal Google ids
 fit; `_delete_button()` returns `None` if an id would overflow, and the keyboard builder omits
 that button rather than sending an invalid one.
+
+**Callback prefixes** handled by `handle_callback()`: `r:<key>` (read a range), `d:<id>`
+(delete an event/series), `x` (cancel).
 
 ## Environment variables
 

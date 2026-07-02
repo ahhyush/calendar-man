@@ -16,6 +16,13 @@ app = Flask(__name__)
 # (and recurring-instance ids) fit comfortably, but we guard against overflow.
 CALLBACK_DATA_LIMIT = 64
 
+# Ranges offered by the /read picker: key → (button label, number of days).
+READ_RANGES = {
+    "today": ("Today", 1),
+    "week": ("This week", 7),
+    "month": ("This month", 30),
+}
+
 
 class CalendarResponse(BaseModel):
     model_config = ConfigDict(json_schema_extra={"additionalProperties": False})
@@ -78,7 +85,7 @@ def delete_event(event_id: str):
     service.events().delete(calendarId="primary", eventId=event_id).execute()
 
 
-def get_events(days: int = 1) -> str:
+def get_events(days: int = 1, label: str = "") -> str:
     service = get_google_calendar_service()
     now = datetime.now()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -92,17 +99,18 @@ def get_events(days: int = 1) -> str:
         orderBy="startTime",
     ).execute()
 
+    # "for today" / "this week" / "this month" for headers and empty states.
+    range_phrase = label.lower() if label else ("today" if days == 1 else "this period")
+
     events = result.get("items", [])
     if not events:
-        if days == 1:
-            return "You have no events scheduled for today."
-        return "You have no events scheduled this week."
+        return f"You have no events scheduled for {range_phrase}."
 
     if days == 1:
         lines = [f"Your events for {now.strftime('%A, %d %B %Y')}:\n"]
     else:
         end_date = (now + timedelta(days=days - 1)).strftime('%A, %d %B')
-        lines = [f"Your events for the week ({now.strftime('%d %B')} - {end_date}):\n"]
+        lines = [f"Your events for {range_phrase} ({now.strftime('%d %B')} - {end_date}):\n"]
 
     current_date = None
     for event in events:
@@ -262,6 +270,15 @@ def _delete_button(label: str, event_id: str):
     return InlineKeyboardButton(label, callback_data=data)
 
 
+def build_read_keyboard():
+    """Range picker shown by /read: Today / This week / This month, one per row."""
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"r:{key}")]
+        for key, (label, _days) in READ_RANGES.items()
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def build_delete_keyboard(events: list):
     """Given candidate events, return (message_text, InlineKeyboardMarkup|None).
 
@@ -283,14 +300,14 @@ def build_delete_keyboard(events: list):
 
         if series_id:
             # One occurrence of a repeating event — offer both scopes.
-            occurrence = _delete_button(f"🗑 Delete just {when}", event["id"])
-            series_btn = _delete_button("🔁 Delete the whole series", series_id)
+            occurrence = _delete_button(f"Delete just {when}", event["id"])
+            series_btn = _delete_button("Delete the whole series", series_id)
             if occurrence:
                 rows.append([occurrence])
             if series_btn:
                 rows.append([series_btn])
         else:
-            occurrence = _delete_button(f"🗑 Delete “{summary}”", event["id"])
+            occurrence = _delete_button(f"Delete “{summary}”", event["id"])
             if occurrence:
                 rows.append([occurrence])
 
@@ -308,7 +325,7 @@ def build_delete_keyboard(events: list):
     for event in events:
         summary = event.get("summary", "No title")
         when = _format_when(event)
-        btn = _delete_button(f"🗑 {summary} — {when}", event["id"])
+        btn = _delete_button(f"Delete {summary} — {when}", event["id"])
         if btn:
             rows.append([btn])
     rows.append([cancel])
@@ -332,11 +349,17 @@ async def handle_callback(query):
         await query.edit_message_text("Cancelled. Nothing was deleted.")
         return
 
+    if data.startswith("r:"):
+        key = data[2:]
+        label, days = READ_RANGES.get(key, READ_RANGES["today"])
+        await query.edit_message_text(get_events(days=days, label=label))
+        return
+
     if data.startswith("d:"):
         event_id = data[2:]
         try:
             delete_event(event_id)
-            await query.edit_message_text("🗑 Deleted.")
+            await query.edit_message_text("Deleted!")
         except Exception:
             # Event may already be gone (410), or the id may be stale.
             await query.edit_message_text(
@@ -378,8 +401,11 @@ async def handle_update(update_data: dict):
             )
             await bot.send_message(chat_id=chat_id, text=welcome)
         elif text == "/read":
-            reply = get_events(days=1)
-            await bot.send_message(chat_id=chat_id, text=reply)
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Which events would you like to see?",
+                reply_markup=build_read_keyboard(),
+            )
         elif text == "/delete" or text.startswith("/delete "):
             query = text[len("/delete"):].strip()
             if not query:
